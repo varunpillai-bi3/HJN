@@ -8,11 +8,13 @@ Handles pipe-delimited CSVs where:
 - Valid lines end with CRLF  (\r\n)
 - Broken lines have an embedded bare LF (\n) inside a field value,
   causing one logical record to split across two (or more) physical lines.
+- Some lines have a split CRLF: the \r ended up on the next physical line
+  as a lone \r (stray CR), caused by the source emitting a bare \n instead
+  of \r\n for that row.
 
 The visible symptom: line N+1 starts with |, making ITEM_NUMBER appear blank.
 """
 
-import re
 import logging
 from dataclasses import dataclass, field
 from typing import Optional
@@ -28,7 +30,7 @@ CRLF           = b"\r\n"
 class RepairEntry:
     line_number:    int
     column_name:    str
-    rule_violated:  str          # EMBEDDED_BARE_LF | BLANK_ITEM_NUMBER | UNESCAPED_QUOTE
+    rule_violated:  str          # EMBEDDED_BARE_LF | BLANK_ITEM_NUMBER | UNESCAPED_QUOTE | STRAY_CR
     original_value: str
     repaired_value: str
     repair_action:  str
@@ -65,6 +67,13 @@ def validate_and_repair(raw_bytes: bytes, file_name: str = "") -> HealthCheckRes
       - no trailing \\r, AND
       - fewer pipes than the expected column count.
 
+    A stray-CR line (sole \\r on its own physical line) is the artefact of
+    a source row that ended with a bare \\n instead of \\r\\n — the \\r
+    belonging to that row landed on the next split segment.  These carry
+    no data and are skipped with a REPAIRED log entry.
+    NOTE: logical_rows_in is NOT incremented here — it was already counted
+    when the preceding bare-LF row was joined, so counts_match stays True.
+
     Repair
     ------
     Concatenate the broken line with the following physical line(s) until
@@ -75,7 +84,7 @@ def validate_and_repair(raw_bytes: bytes, file_name: str = "") -> HealthCheckRes
     --------------
     logical_rows_in  == logical data records parsed from raw bytes.
     logical_rows_out == logical data records in the clean output.
-    For LF-join repairs these are always equal (no records dropped).
+    For LF-join repairs and stray-CR removals these are always equal.
     A mismatch means something went wrong and the caller should quarantine.
     """
 
@@ -112,6 +121,29 @@ def validate_and_repair(raw_bytes: bytes, file_name: str = "") -> HealthCheckRes
             i += 1
             continue
 
+        # ── Stray-CR line: bare \r with no data ───────────────────────────────
+        # Artefact of a source row that ended with \n instead of \r\n.
+        # The \r was split onto its own physical segment — it carries no data.
+        # We drop it and log the repair.
+        # logical_rows_in is NOT incremented here: the preceding bare-LF row
+        # already incremented it during its join, so counts_match stays True.
+        if line == b"\r":
+            repairs.append(RepairEntry(
+                line_number    = i + 1,
+                column_name    = "N/A",
+                rule_violated  = "STRAY_CR",
+                original_value = repr(line),
+                repaired_value = "(line removed)",
+                repair_action  = "REMOVED_STRAY_CR",
+            ))
+            logging.warning(
+                f"[HealthCheck] {file_name} | "
+                f"Line {i + 1}: stray CR removed "
+                f"(source emitted bare LF on previous row)"
+            )
+            i += 1
+            continue
+
         pipes = line.count(DELIMITER)
 
         # ── Healthy line: correct pipe count + trailing \r ────────────────────
@@ -124,14 +156,18 @@ def validate_and_repair(raw_bytes: bytes, file_name: str = "") -> HealthCheckRes
 
         # ── Broken line: bare-LF split ────────────────────────────────────────
         if pipes < expected_pipes and not line.endswith(b"\r"):
-            origin  = i + 1       # 1-based for logging
-            joined  = line
+            origin   = i + 1       # 1-based for logging
+            joined   = line
             consumed = 1
 
             while joined.count(DELIMITER) < expected_pipes:
                 nxt = i + consumed
                 if nxt >= len(physical):
                     break
+                # Skip any stray-CR segment that appears mid-join
+                if physical[nxt] == b"\r":
+                    consumed += 1
+                    continue
                 joined = joined + physical[nxt]
                 consumed += 1
 
@@ -153,6 +189,7 @@ def validate_and_repair(raw_bytes: bytes, file_name: str = "") -> HealthCheckRes
                     f"joined {consumed} physical lines"
                 )
                 logical_in += 1
+                # Check for blank ITEM_NUMBER on the fully joined row
                 _flag_blank_item_number(joined, origin, repairs)
                 logical_rows.append(joined)
                 i += consumed
@@ -180,8 +217,17 @@ def validate_and_repair(raw_bytes: bytes, file_name: str = "") -> HealthCheckRes
                 )
             )
 
-        logical_rows.append(line)
-        i += 1
+        # ── Unhandled case: excess pipes, no trailing \r — quarantine ─────────
+        # Reached if pipes > expected_pipes and line does not end with \r.
+        # Cannot determine intent; quarantine rather than silently pass through.
+        return HealthCheckResult(
+            status="QUARANTINED",
+            quarantine_reason=(
+                f"Line {i + 1}: unexpected format — "
+                f"{pipes} pipes found (expected {expected_pipes}), "
+                f"no trailing CR. Cannot auto-repair."
+            )
+        )
 
     # ── Reassemble with normalised CRLF endings ───────────────────────────────
     clean_bytes  = b"".join(r.rstrip(b"\r") + CRLF for r in logical_rows)
@@ -198,7 +244,7 @@ def validate_and_repair(raw_bytes: bytes, file_name: str = "") -> HealthCheckRes
     )
 
 
-# ─── Unescaped quote validation (new) ─────────────────────────────────────────
+# ─── Unescaped quote validation ────────────────────────────────────────────────
 
 def detect_and_repair_unescaped_quotes(
     raw_bytes: bytes, file_name: str = ""
@@ -208,19 +254,6 @@ def detect_and_repair_unescaped_quotes(
 
     The bad pattern:  "This is a "text"."
     The fix:          "This is a ""text"."
-
-    A quote inside a quoted field is only valid if it is immediately followed
-    by another quote (escaped) or immediately followed by a pipe, newline,
-    carriage return, or end-of-string (closing the field). Any other quote
-    inside a quoted field is unescaped and must be doubled.
-
-    Works with pipe-delimited (|) files, matching the existing delimiter.
-
-    Returns:
-        (repaired_bytes, repair_count, issue_descriptions)
-        - repaired_bytes  : bytes with unescaped quotes fixed
-        - repair_count    : number of lines that were repaired
-        - issue_descriptions : list of human-readable strings per repaired line
     """
     try:
         text = raw_bytes.decode("utf-8-sig")
@@ -251,11 +284,6 @@ def detect_and_repair_unescaped_quotes(
 
 
 def _repair_line_quotes(line: str) -> str:
-    """
-    Walk the line character by character and fix unescaped quotes inside
-    quoted fields. Handles pipe as delimiter (|), escaped quotes (doubled),
-    and trailing newlines/carriage returns.
-    """
     result = []
     i      = 0
     n      = len(line)
@@ -263,13 +291,11 @@ def _repair_line_quotes(line: str) -> str:
     while i < n:
         ch = line[i]
 
-        # ── Outside a quoted field ────────────────────────────────────────────
         if ch != '"':
             result.append(ch)
             i += 1
             continue
 
-        # ── Opening quote of a field ──────────────────────────────────────────
         result.append('"')
         i += 1
 
@@ -280,21 +306,15 @@ def _repair_line_quotes(line: str) -> str:
                 next_ch = line[i + 1] if i + 1 < n else ""
 
                 if next_ch == '"':
-                    # Already a valid escaped quote — keep both
                     result.append('""')
                     i += 2
-
                 elif next_ch in ("|", "\n", "\r", ""):
-                    # Legitimate closing quote (pipe is the delimiter here)
                     result.append('"')
                     i += 1
                     break
-
                 else:
-                    # Unescaped quote mid-field — double it to escape
                     result.append('""')
                     i += 1
-
             else:
                 result.append(c)
                 i += 1
@@ -316,25 +336,3 @@ def _flag_blank_item_number(line: bytes, line_no: int, repairs: list):
             repaired_value = "(resolved by LF join — see EMBEDDED_BARE_LF entry)",
             repair_action  = "DETECTED_POST_JOIN",
         ))
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

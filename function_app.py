@@ -1,4 +1,3 @@
-import io
 import os
 import json
 import logging
@@ -7,77 +6,145 @@ from datetime import datetime
 import azure.functions as func
 from azure.storage.blob import BlobServiceClient, ContentSettings
 
-from health_check import validate_and_repair, detect_and_repair_unescaped_quotes, RepairEntry, HealthCheckResult
+from health_check import (
+    validate_and_repair,
+    detect_and_repair_unescaped_quotes,
+    RepairEntry,
+    HealthCheckResult,
+)
 
 app = func.FunctionApp()
 
 
-def send_teams_alert(actual_count: int, expected: int = 46):
-    """Post an alert card to a Teams chat via Power Automate Workflows webhook.
+# ─── Teams alert ──────────────────────────────────────────────────────────────
+
+def send_teams_alert(
+    run_ts_disp:       str,
+    actual_count:      int,
+    expected:          int,
+    quarantined_files: list[dict],   # [{"name": "file.csv", "reason": "..."}]
+    repaired_count:    int,
+    valid_count:       int,
+    log_path:          str,
+) -> None:
+    """
+    Post an Adaptive Card to Teams via Power Automate webhook.
+
+    Card layout
+    -----------
+    Status   : ✅ Good  |  🚨 Action Needed
+    ─────────────────────────────────────────
+    Run Time          : ...
+    Total Files       : ...
+    Valid Files       : ...
+    Repaired Files    : ...   (auto-fixed, staged with _repaired suffix)
+    Quarantined Files : ...
+    Run Log           : ...
+    ─────────────────────────────────────────
+    Quarantined File Details   (only if any)
+      • filename — reason
+
     Never raises — Teams failure must not block the pipeline.
     """
     try:
         webhook_url = os.environ["TEAMS_WEBHOOK_URL"]
-        run_date    = datetime.utcnow().strftime("%Y-%m-%d")
-        missing     = expected - actual_count
+        missing     = max(0, expected - actual_count)
+        n_quarant   = len(quarantined_files)
+
+        # ── Status header ─────────────────────────────────────────────────────
+        if n_quarant > 0 or missing > 0:
+            status_text  = "🚨 Action Needed"
+            status_color = "Attention"
+        else:
+            status_text  = "✅ Good"
+            status_color = "Good"
+
+        # ── Summary facts ─────────────────────────────────────────────────────
+        summary_facts = [
+            {"title": "Status",            "value": status_text},
+            {"title": "Run Time",          "value": run_ts_disp},
+            {"title": "Total Files",       "value": str(actual_count)},
+            {"title": "Valid Files",       "value": str(valid_count)},
+            {"title": "Repaired Files",    "value": str(repaired_count)},
+            {"title": "Quarantined Files", "value": str(n_quarant)},
+            {"title": "Run Log",           "value": log_path},
+        ]
+        if missing > 0:
+            summary_facts.insert(3, {"title": "Missing Files", "value": str(missing)})
+
+        # ── Card body ─────────────────────────────────────────────────────────
+        body = [
+            {
+                "type":   "TextBlock",
+                "text":   "OPH Data Pipeline — Run Summary",
+                "weight": "Bolder",
+                "size":   "Large",
+                "wrap":   True,
+            },
+            {
+                "type":  "FactSet",
+                "facts": summary_facts,
+            },
+        ]
+
+        # Quarantined file details — name + exact reason
+        if quarantined_files:
+            body.append({
+                "type":    "TextBlock",
+                "text":    "**Quarantined File Details**",
+                "weight":  "Bolder",
+                "color":   "Attention",
+                "wrap":    True,
+                "spacing": "Medium",
+            })
+            for qf in quarantined_files:
+                body.append({
+                    "type":    "TextBlock",
+                    "text":    f"• **{qf['name']}**\n  {qf['reason']}",
+                    "wrap":    True,
+                    "spacing": "Small",
+                    "color":   "Attention",
+                })
+
+        # Missing files SFTP note
+        if missing > 0:
+            body.append({
+                "type":    "TextBlock",
+                "text":    (
+                    f"⚠️ {missing} file(s) missing from expected {expected}. "
+                    f"Please check SFTP: bi-sftp-production → BI → oph-extracts → inbound"
+                ),
+                "wrap":    True,
+                "color":   "Warning",
+                "spacing": "Medium",
+            })
 
         payload = {
             "type": "message",
             "attachments": [
                 {
                     "contentType": "application/vnd.microsoft.card.adaptive",
-                    "contentUrl": None,
+                    "contentUrl":  None,
                     "content": {
                         "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
-                        "type": "AdaptiveCard",
+                        "type":    "AdaptiveCard",
                         "version": "1.2",
-                        "body": [
-                            {
-                                "type": "TextBlock",
-                                "text": "⚠️ OPH File Count Alert",
-                                "weight": "Bolder",
-                                "size": "Large",
-                                "color": "Warning",
-                                "wrap": True
-                            },
-                            {
-                                "type": "FactSet",
-                                "facts": [
-                                    {"title": "Date",           "value": run_date},
-                                    {"title": "Expected Files", "value": str(expected)},
-                                    {"title": "Received Files", "value": str(actual_count)},
-                                    {"title": "Missing Files",  "value": str(missing)}
-                                ]
-                            },
-                            {
-                                "type": "TextBlock",
-                                "text": (
-                                    f"The pipeline has continued and will load the "
-                                    f"{actual_count} file(s) received. "
-                                    f"Please check the SFTP inbound folder: "
-                                    f"bi-sftp-production → BI → oph-extracts → inbound"
-                                ),
-                                "wrap": True,
-                                "color": "Attention"
-                            }
-                        ]
-                    }
+                        "body":    body,
+                    },
                 }
-            ]
+            ],
         }
 
         data = json.dumps(payload).encode("utf-8")
         req  = urllib.request.Request(
             webhook_url,
-            data=data,
-            headers={"Content-Type": "application/json"}
+            data    = data,
+            headers = {"Content-Type": "application/json"},
         )
-        with urllib.request.urlopen(req, timeout=10) as resp:
+        with urllib.request.urlopen(req, timeout=15) as resp:
             response_body = resp.read().decode("utf-8")
             logging.info(
-                f"[HealthCheck] Teams alert sent — "
-                f"actual={actual_count} expected={expected} "
-                f"| HTTP {resp.status} | response={response_body}"
+                f"[HealthCheck] Teams alert sent | HTTP {resp.status} | {response_body}"
             )
 
     except Exception as e:
@@ -86,204 +153,193 @@ def send_teams_alert(actual_count: int, expected: int = 46):
         )
 
 
-def _repaired_filename(file_name: str) -> str:
-    """Return the blob name for a repaired file.
-
-    Examples
-    --------
-    file2.csv        → file2_repaired.csv
-    archive.tar.csv  → archive.tar_repaired.csv
-    """
-    base, ext = os.path.splitext(file_name)
-    return f"{base}_repaired{ext}"
-
+# ─── Run log upload ────────────────────────────────────────────────────────────
 
 def _upload_run_log(
-    blob_svc: BlobServiceClient,
-    container: str,
-    quarantine_path: str,
-    run_ts: str,
-    log_lines: list[str],
-) -> None:
-    """Write a plain-text run log to the quarantine folder.
+    blob_svc:   BlobServiceClient,
+    container:  str,
+    log_path:   str,
+    run_ts:     str,
+    log_lines:  list[str],
+) -> str:
+    """
+    Write a plain-text run log to  <log_path>/YYYY/MM/DD/run_<timestamp>.txt
 
-    The blob name is:  <quarantine_path>/run_logs/run_<YYYYMMDD_HHMMSS_UTC>.txt
+    Uses ADLS_LOG_PATH (varun/logs) — a folder that is intentionally excluded
+    from ADF delete activities so logs accumulate permanently.
 
+    Structure on ADLS:
+        varun/logs/
+            2026/
+                05/
+                    27/
+                        run_20260527_093012_UTC.txt
+                        run_20260527_141500_UTC.txt
+
+    Returns the full blob path so it can be shown in the Teams card.
     Never raises — log failure must not block the pipeline.
     """
-    try:
-        log_blob_name = f"{quarantine_path}/run_logs/run_{run_ts}.txt"
-        log_content   = "\n".join(log_lines).encode("utf-8")
+    _now      = datetime.utcnow()
+    year      = _now.strftime("%Y")
+    month     = _now.strftime("%m")
+    day       = _now.strftime("%d")
+    blob_name = f"{log_path}/{year}/{month}/{day}/run_{run_ts}.txt"
 
+    try:
+        log_content = "\n".join(log_lines).encode("utf-8")
         blob_svc.get_blob_client(
-            container=container, blob=log_blob_name
+            container=container,
+            blob=blob_name,
         ).upload_blob(
             log_content,
-            overwrite=True,
-            content_settings=ContentSettings(content_type="text/plain"),
+            overwrite        = True,
+            content_settings = ContentSettings(content_type="text/plain"),
         )
-        logging.info(
-            f"[HealthCheck] Run log written → {container}/{log_blob_name}"
-        )
+        logging.info(f"[HealthCheck] Run log written → {container}/{blob_name}")
+        return f"{container}/{blob_name}"
+
     except Exception as e:
         logging.error(
             f"[HealthCheck] Run log upload FAILED (pipeline continues) — {str(e)}"
         )
+        return f"{container}/{blob_name} (UPLOAD FAILED)"
+
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def _repaired_filename(file_name: str) -> str:
+    """file2.csv → file2_repaired.csv"""
+    base, ext = os.path.splitext(file_name)
+    return f"{base}_repaired{ext}"
 
 
 def _normalise_filenames(raw: list) -> list[str]:
     """
-    Normalise the filenames list that arrives from ADF.
-
-    ADF Copy Data activity can send filenames in two shapes:
-
-      Shape A — plain strings (Postman / manual calls):
-        ["file1.csv", "file2.csv"]
-
-      Shape B — file-object dicts (ADF output.files array):
-        [
-          {"source": "oph-extracts/inbound/file1.csv",
-           "destination": "varun/input/file1.csv"},
-          ...
-        ]
-
-    In both cases we want only the bare filename (no path prefix).
-    For Shape B we prefer the destination path so it matches what
-    was actually written to ADLS.
+    Accept filenames from ADF in three shapes and return bare filenames.
+      Shape A — plain strings:   ["file1.csv", ...]
+      Shape B — Copy output:     [{"source": "...", "destination": "..."}, ...]
+      Shape C — GetMetadata:     [{"name": "file.csv", "type": "File"}, ...]
     """
     normalised = []
     for item in raw:
         if isinstance(item, str):
-            # Shape A — already a string; strip any leading path
             normalised.append(os.path.basename(item))
-
         elif isinstance(item, dict):
-            # Shape B — ADF GetMetadata childItems:  {"name": "file.csv", "type": "File"}
-            # Shape C — ADF Copy output.files:        {"source": "...", "destination": "..."}
             path = (
-                item.get("name")                              # GetMetadata childItems
-                or item.get("destination")                    # Copy output.files destination
-                or item.get("source")                         # Copy output.files source
+                item.get("name")
+                or item.get("destination")
+                or item.get("source")
                 or ""
             )
             normalised.append(os.path.basename(path))
-
         else:
-            # Unexpected type — convert to string and log; don't crash
             logging.warning(
                 f"[HealthCheck] Unexpected filename entry type "
                 f"{type(item).__name__}: {item!r} — skipping"
             )
+    return [f for f in normalised if f]
 
-    return [f for f in normalised if f]   # drop empty strings
 
+# ─── HTTP trigger ──────────────────────────────────────────────────────────────
 
 @app.function_name(name="health_check_http")
 @app.route(route="copyfile", methods=["POST"])
 def health_check_http(req: func.HttpRequest) -> func.HttpResponse:
     logging.info("[HealthCheck] HTTP trigger fired")
 
-    # Capture run timestamp once — used for both logging and the log filename
-    run_ts      = datetime.utcnow().strftime("%Y%m%d_%H%M%S_UTC")
-    run_ts_disp = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
+    _now        = datetime.utcnow()
+    run_ts      = _now.strftime("%Y%m%d_%H%M%S_UTC")
+    run_ts_disp = _now.strftime("%Y-%m-%d %H:%M:%S UTC")
 
+    # ── Parse request ─────────────────────────────────────────────────────────
     try:
         req_body = req.get_json()
         logging.info(f"[HealthCheck] Request body: {req_body}")
     except ValueError:
         return func.HttpResponse("Invalid JSON body", status_code=400)
 
-    # -------------------------------------------------------------------------
-    # Accept filenames in two formats:
-    #   1. Plain string array  — {"filenames": ["file1.csv", ...]}
-    #   2. ADF file-object array — {"filenames": [{"source":..., "destination":...}, ...]}
-    # _normalise_filenames() converts both to a flat list of bare filenames.
-    # -------------------------------------------------------------------------
     raw_filenames = req_body.get("filenames")
-
     if not raw_filenames or not isinstance(raw_filenames, list):
         return func.HttpResponse(
             "Missing 'filenames' array in request body", status_code=400
         )
 
     filenames = _normalise_filenames(raw_filenames)
-
     if not filenames:
         return func.HttpResponse(
             "No valid filenames could be extracted from 'filenames' array",
-            status_code=400
+            status_code=400,
         )
 
     logging.info(
-        f"[HealthCheck] Normalised {len(filenames)} filename(s) from "
-        f"{len(raw_filenames)} raw entr(ies)"
+        f"[HealthCheck] Normalised {len(filenames)} filename(s) "
+        f"from {len(raw_filenames)} raw entr(ies)"
     )
 
+    # ── Environment variables — all driven from Azure App Settings ────────────
     conn_str        = os.environ["ADLS_CONNECTION_STRING"]
-    container       = os.environ.get("ADLS_CONTAINER",        "dev")
-    input_path      = os.environ.get("ADLS_INPUT_PATH",       "varun/input")
-    staged_path     = os.environ.get("ADLS_STAGED_PATH",      "varun/output/staged")
-    quarantine_path = os.environ.get("ADLS_QUARANTINE_PATH",  "varun/output/quarantine")
+    container       = os.environ.get("ADLS_CONTAINER",       "dev")
+    input_path      = os.environ.get("ADLS_INPUT_PATH",      "varun/input")
+    staged_path     = os.environ.get("ADLS_STAGED_PATH",     "varun/output/staged")
+    quarantine_path = os.environ.get("ADLS_QUARANTINE_PATH", "varun/output/quarantine")
+    log_path        = os.environ.get("ADLS_LOG_PATH",        "varun/logs")
 
     blob_svc = BlobServiceClient.from_connection_string(conn_str)
     results  = []
 
-    # -------------------------------------------------------------------------
-    # Run-log buffer
-    # -------------------------------------------------------------------------
+    # ── Per-run tracking (fed into Teams card) ────────────────────────────────
+    quarantined_files: list[dict] = []   # {"name": ..., "reason": ...}
+    repaired_files:    list[str]  = []
+    valid_files:       list[str]  = []
+
+    # ── Run log buffer ────────────────────────────────────────────────────────
     log_buf: list[str] = [
         "=" * 72,
-        f"OPH Health-Check Pipeline Run Log",
+        "OPH Health-Check Pipeline Run Log",
         f"Run timestamp : {run_ts_disp}",
         f"Files received: {len(filenames)}",
+        f"Log path      : {container}/{log_path}",
         "=" * 72,
         "",
     ]
 
+    # ── Process each file ─────────────────────────────────────────────────────
     for file_name in filenames:
+        quote_repair_count  = 0
+        quote_issues:  list[str] = []
+        quarantine_reason: str   = ""
+
         log_buf.append(f"--- {file_name} ---")
 
         if not file_name.endswith(".csv"):
-            msg = f"SKIPPED — not a CSV: {file_name}"
-            results.append(msg)
-            log_buf.append(f"  Status : SKIPPED (not a CSV)")
+            results.append(f"SKIPPED — not a CSV: {file_name}")
+            log_buf.append("  Status : SKIPPED (not a CSV)")
             log_buf.append("")
             continue
 
         try:
             # Read source blob
-            input_blob = blob_svc.get_blob_client(
-                container=container,
-                blob=f"{input_path}/{file_name}"
-            )
-            raw_bytes = input_blob.download_blob().readall()
+            raw_bytes = blob_svc.get_blob_client(
+                container = container,
+                blob      = f"{input_path}/{file_name}",
+            ).download_blob().readall()
+
             log_buf.append(f"  Size   : {len(raw_bytes)} bytes")
             logging.info(
                 f"[HealthCheck] FILE READ — {file_name} | size={len(raw_bytes)} bytes"
             )
 
-            # ------------------------------------------------------------------
-            # Validate and repair (existing structural checks)
-            # ------------------------------------------------------------------
+            # Stage 1 — structural validation + repair
             result: HealthCheckResult = validate_and_repair(raw_bytes, file_name)
             logging.info(
-                f"[HealthCheck] Validation result — {file_name} "
+                f"[HealthCheck] Structural check — {file_name} "
                 f"| status={result.status} "
                 f"| rows_in={result.logical_rows_in} "
                 f"| rows_out={result.logical_rows_out}"
             )
 
-            # ------------------------------------------------------------------
-            # Unescaped-quote validation
-            # ------------------------------------------------------------------
-            if result.status == "QUARANTINED" or result.clean_bytes is None:
-                quote_repair_count = 0
-                quote_issues       = []
-                logging.info(
-                    f"[HealthCheck] Quote check SKIPPED — "
-                    f"{file_name} is already QUARANTINED"
-                )
-            else:
+            # Stage 2 — unescaped quote repair (skip if already quarantined)
+            if result.status != "QUARANTINED" and result.clean_bytes is not None:
                 repaired_bytes, quote_repair_count, quote_issues = \
                     detect_and_repair_unescaped_quotes(result.clean_bytes, file_name)
 
@@ -292,11 +348,7 @@ def health_check_http(req: func.HttpRequest) -> func.HttpResponse:
                         f"[HealthCheck] UNESCAPED QUOTES — {file_name} | "
                         f"{quote_repair_count} line(s) repaired"
                     )
-                    for issue in quote_issues:
-                        logging.warning(f"[HealthCheck]   {issue}")
-
                     result.clean_bytes = repaired_bytes
-
                     for issue in quote_issues:
                         result.repairs.append(RepairEntry(
                             line_number    = 0,
@@ -306,64 +358,71 @@ def health_check_http(req: func.HttpRequest) -> func.HttpResponse:
                             repaired_value = "(unescaped quote doubled)",
                             repair_action  = "DOUBLED_UNESCAPED_QUOTE",
                         ))
-
-                    if result.status != "QUARANTINED":
-                        result.status = "REPAIRED"
+                    result.status = "REPAIRED"
                 else:
-                    logging.info(
-                        f"[HealthCheck] Quote check OK — no unescaped quotes in {file_name}"
-                    )
+                    logging.info(f"[HealthCheck] Quote check OK — {file_name}")
+            else:
+                logging.info(
+                    f"[HealthCheck] Quote check SKIPPED — {file_name} already QUARANTINED"
+                )
 
-            # ------------------------------------------------------------------
-            # Routing
-            # ------------------------------------------------------------------
+            # Capture quarantine reason before routing
             if result.status == "QUARANTINED" or not result.counts_match:
-                dest        = f"{quarantine_path}/{file_name}"
-                data        = raw_bytes
-                status_tag  = "QUARANTINED"
-                dest_label  = f"{container}/{dest}"
+                quarantine_reason = (
+                    result.quarantine_reason
+                    or (
+                        f"Row count mismatch — "
+                        f"rows_in={result.logical_rows_in}, "
+                        f"rows_out={result.logical_rows_out}"
+                    )
+                )
+
+            # Route to staged / quarantine
+            if result.status == "QUARANTINED" or not result.counts_match:
+                dest       = f"{quarantine_path}/{file_name}"
+                data       = raw_bytes
+                status_tag = "QUARANTINED"
+                quarantined_files.append({"name": file_name, "reason": quarantine_reason})
 
             elif result.status == "REPAIRED":
-                repaired_name = _repaired_filename(file_name)
-                dest          = f"{staged_path}/{repaired_name}"
-                data          = result.clean_bytes
-                status_tag    = "REPAIRED"
-                dest_label    = f"{container}/{dest}"
+                dest       = f"{staged_path}/{_repaired_filename(file_name)}"
+                data       = result.clean_bytes
+                status_tag = "REPAIRED"
+                repaired_files.append(file_name)
 
-            else:  # VALID
-                dest        = f"{staged_path}/{file_name}"
-                data        = result.clean_bytes
-                status_tag  = "VALID"
-                dest_label  = f"{container}/{dest}"
+            else:   # VALIDATED
+                dest       = f"{staged_path}/{file_name}"
+                data       = result.clean_bytes
+                status_tag = "VALID"
+                valid_files.append(file_name)
 
-            # Upload
+            dest_label = f"{container}/{dest}"
+
+            # Upload result blob
             blob_svc.get_blob_client(
                 container=container, blob=dest
             ).upload_blob(
                 data,
-                overwrite=True,
-                content_settings=ContentSettings(content_type="text/csv"),
+                overwrite        = True,
+                content_settings = ContentSettings(content_type="text/csv"),
             )
-            logging.info(
-                f"[HealthCheck] SUCCESS — {file_name} → {dest_label}"
-            )
+            logging.info(f"[HealthCheck] SUCCESS — {file_name} → {dest_label}")
 
-            quote_note = (
-                f" | quote_repairs={quote_repair_count}" if quote_repair_count > 0 else ""
-            )
-            result_line = (
+            quote_note  = f" | quote_repairs={quote_repair_count}" if quote_repair_count > 0 else ""
+            results.append(
                 f"{status_tag} — {file_name} → {dest_label} "
                 f"| rows={result.logical_rows_out} "
                 f"| repairs={result.repairs_made}"
                 f"{quote_note}"
             )
-            results.append(result_line)
 
             log_buf.append(f"  Status       : {status_tag}")
             log_buf.append(f"  Destination  : {dest_label}")
             log_buf.append(f"  Rows in      : {result.logical_rows_in}")
             log_buf.append(f"  Rows out     : {result.logical_rows_out}")
             log_buf.append(f"  Repairs made : {result.repairs_made}")
+            if status_tag == "QUARANTINED":
+                log_buf.append(f"  Reason       : {quarantine_reason}")
             if quote_repair_count > 0:
                 log_buf.append(f"  Quote repairs: {quote_repair_count}")
                 for issue in quote_issues:
@@ -373,49 +432,64 @@ def health_check_http(req: func.HttpRequest) -> func.HttpResponse:
             err_msg = f"FAILED — {file_name} | error: {str(e)}"
             logging.error(f"[HealthCheck] {err_msg}")
             results.append(err_msg)
+            quarantined_files.append({"name": file_name, "reason": f"Exception: {str(e)}"})
             log_buf.append(f"  Status : FAILED")
             log_buf.append(f"  Error  : {str(e)}")
 
         log_buf.append("")
 
-    # -------------------------------------------------------------------------
-    # File count validation
-    # -------------------------------------------------------------------------
+    # ── File count check ──────────────────────────────────────────────────────
     expected_count = int(os.environ.get("EXPECTED_FILE_COUNT", "46"))
-    csv_files      = [f for f in filenames if f.endswith(".csv")]
-    actual_count   = len(csv_files)
+    actual_count   = len([f for f in filenames if f.endswith(".csv")])
 
     logging.info(
-        f"[HealthCheck] File count check — "
-        f"actual={actual_count} expected={expected_count}"
+        f"[HealthCheck] File count — actual={actual_count} expected={expected_count}"
     )
 
     log_buf.append("=" * 72)
     log_buf.append("File Count Check")
     log_buf.append(f"  Expected : {expected_count}")
     log_buf.append(f"  Received : {actual_count}")
+    log_buf.append(f"  Valid    : {len(valid_files)}")
+    log_buf.append(f"  Repaired : {len(repaired_files)}")
+    log_buf.append(f"  Quarant. : {len(quarantined_files)}")
 
     if actual_count < expected_count:
-        alert_msg = (
-            f"⚠️ TEAMS ALERT SENT — only {actual_count}/{expected_count} "
-            f"CSV files received."
-        )
+        missing = expected_count - actual_count
         logging.warning(
-            f"[HealthCheck] LOW FILE COUNT — "
-            f"{actual_count}/{expected_count} files. Sending Teams alert."
+            f"[HealthCheck] LOW FILE COUNT — {actual_count}/{expected_count}"
         )
-        send_teams_alert(actual_count, expected_count)
-        results.append(alert_msg)
-        log_buf.append(f"  Outcome  : LOW — Teams alert sent")
+        results.append(
+            f"⚠️ LOW FILE COUNT — {actual_count}/{expected_count} CSV files. "
+            f"{missing} missing."
+        )
+        log_buf.append(f"  Outcome  : LOW — {missing} file(s) missing")
     else:
-        ok_msg = f"✅ FILE COUNT OK — {actual_count}/{expected_count}"
         logging.info(f"[HealthCheck] File count OK — {actual_count}/{expected_count}")
-        results.append(ok_msg)
+        results.append(f"✅ FILE COUNT OK — {actual_count}/{expected_count}")
         log_buf.append(f"  Outcome  : OK")
 
     log_buf.append("=" * 72)
-    log_buf.append(f"End of run log — {run_ts_disp}")
+    log_buf.append(f"End of run — {run_ts_disp}")
 
-    _upload_run_log(blob_svc, container, quarantine_path, run_ts, log_buf)
+    # ── Write log to varun/logs/YYYY/MM/DD/ ───────────────────────────────────
+    log_full_path = _upload_run_log(
+        blob_svc  = blob_svc,
+        container = container,
+        log_path  = log_path,
+        run_ts    = run_ts,
+        log_lines = log_buf,
+    )
+
+    # ── Send Teams alert (every run) ──────────────────────────────────────────
+    send_teams_alert(
+        run_ts_disp       = run_ts_disp,
+        actual_count      = actual_count,
+        expected          = expected_count,
+        quarantined_files = quarantined_files,
+        repaired_count    = len(repaired_files),
+        valid_count       = len(valid_files),
+        log_path          = log_full_path,
+    )
 
     return func.HttpResponse("\n".join(results), status_code=200)
