@@ -5,23 +5,23 @@ Core CSV validation and repair logic.
 No Azure dependencies — pure Python, fully testable in isolation.
 
 Handles pipe-delimited CSVs where:
-- Valid lines end with CRLF  (\r\n)
+- Valid lines end with CRLF (\r\n)
 - Broken lines have an embedded bare LF (\n) inside a field value,
-  causing one logical record to split across two (or more) physical lines.
-- Some lines have a split CRLF: the \r ended up on the next physical line
-  as a lone \r (stray CR), caused by the source emitting a bare \n instead
-  of \r\n for that row.
+  causing one logical record to split across two or more physical lines.
+- Some lines have a blank row caused by an inverted line ending (\n\r)
+  from the ERP export — quarantined with a clear reason for ERP team.
 
-The visible symptom: line N+1 starts with |, making ITEM_NUMBER appear blank.
+The visible symptom of embedded LF: line N+1 starts with |, making
+ITEM_NUMBER appear blank.
 """
 
 import logging
 from dataclasses import dataclass, field
 from typing import Optional
 
-DELIMITER      = b"|"
-LF             = b"\n"
-CRLF           = b"\r\n"
+DELIMITER = b"|"
+LF        = b"\n"
+CRLF      = b"\r\n"
 
 
 # ─── Result types ─────────────────────────────────────────────────────────────
@@ -30,7 +30,7 @@ CRLF           = b"\r\n"
 class RepairEntry:
     line_number:    int
     column_name:    str
-    rule_violated:  str          # EMBEDDED_BARE_LF | BLANK_ITEM_NUMBER | UNESCAPED_QUOTE | STRAY_CR
+    rule_violated:  str   # EMBEDDED_BARE_LF | BLANK_ITEM_NUMBER | UNESCAPED_QUOTE | STRAY_CR
     original_value: str
     repaired_value: str
     repair_action:  str
@@ -38,11 +38,11 @@ class RepairEntry:
 
 @dataclass
 class HealthCheckResult:
-    status:           str        # VALIDATED | REPAIRED | QUARANTINED
-    clean_bytes:      Optional[bytes] = None
-    logical_rows_in:  int = 0
-    logical_rows_out: int = 0
-    repairs:          list = field(default_factory=list)
+    status:            str        # VALIDATED | REPAIRED | QUARANTINED
+    clean_bytes:       Optional[bytes] = None
+    logical_rows_in:   int = 0
+    logical_rows_out:  int = 0
+    repairs:           list = field(default_factory=list)
     quarantine_reason: Optional[str] = None
 
     @property
@@ -60,44 +60,40 @@ def validate_and_repair(raw_bytes: bytes, file_name: str = "") -> HealthCheckRes
     """
     Validates and repairs a pipe-delimited CSV file.
 
-    Detection
-    ---------
-    Split the raw file on bare LF.  Every healthy line ends with \\r after
-    the split (it was \\r\\n).  A line with an embedded bare LF will have:
-      - no trailing \\r, AND
-      - fewer pipes than the expected column count.
+    Detection / repair cases (in order)
+    ------------------------------------
+    1. STRAY_CR
+       A lone b"\\r" physical segment — artefact of a preceding bare-LF row.
+       Dropped silently. logical_in NOT incremented.
 
-    A stray-CR line (sole \\r on its own physical line) is the artefact of
-    a source row that ended with a bare \\n instead of \\r\\n — the \\r
-    belonging to that row landed on the next split segment.  These carry
-    no data and are skipped with a REPAIRED log entry.
-    NOTE: logical_rows_in is NOT incremented here — it was already counted
-    when the preceding bare-LF row was joined, so counts_match stays True.
+    2. Healthy CRLF line
+       Correct pipe count + trailing \\r. Accepted as-is.
 
-    Repair
-    ------
-    Concatenate the broken line with the following physical line(s) until
-    the pipe count reaches the expected value.  The join is recorded in
-    the repair log so there is a full audit trail.
+    3. EMBEDDED_BARE_LF  (pipes < expected, no trailing \\r)
+       Field value contains a bare \\n splitting one record across lines.
+       Joined until pipe count is satisfied.
 
-    Reconciliation
-    --------------
-    logical_rows_in  == logical data records parsed from raw bytes.
-    logical_rows_out == logical data records in the clean output.
-    For LF-join repairs and stray-CR removals these are always equal.
-    A mismatch means something went wrong and the caller should quarantine.
+    4. Wrong pipe count on CRLF line
+       Cannot repair — quarantine.
+
+    5. BLANK_ROW_DETECTED  (pipes == expected, no trailing \\r, next seg == b"\\r")
+       ERP export defect: line ending written as \\n\\r instead of \\r\\n.
+       The \\r lands alone on the next segment, appearing as a blank row in Excel.
+       Policy: DO NOT auto-repair. Quarantine with clear reason for ERP team.
+
+    6. Unhandled
+       Cannot determine intent — quarantine.
     """
 
-    # ── Guard: empty file ─────────────────────────────────────────────────────
     if not raw_bytes:
         return HealthCheckResult(
             status="QUARANTINED",
             quarantine_reason="File is zero bytes"
         )
 
-    physical        = raw_bytes.split(LF)
-    header          = physical[0]
-    expected_pipes  = header.rstrip(b"\r").count(DELIMITER)
+    physical       = raw_bytes.split(LF)
+    header         = physical[0]
+    expected_pipes = header.rstrip(b"\r").count(DELIMITER)
 
     if expected_pipes < 1:
         return HealthCheckResult(
@@ -121,32 +117,26 @@ def validate_and_repair(raw_bytes: bytes, file_name: str = "") -> HealthCheckRes
             i += 1
             continue
 
-        # ── Stray-CR line: bare \r with no data ───────────────────────────────
-        # Artefact of a source row that ended with \n instead of \r\n.
-        # The \r was split onto its own physical segment — it carries no data.
-        # We drop it and log the repair.
-        # logical_rows_in is NOT incremented here: the preceding bare-LF row
-        # already incremented it during its join, so counts_match stays True.
+        # ── Case 1: Stray-CR segment ──────────────────────────────────────────
         if line == b"\r":
             repairs.append(RepairEntry(
                 line_number    = i + 1,
                 column_name    = "N/A",
                 rule_violated  = "STRAY_CR",
                 original_value = repr(line),
-                repaired_value = "(line removed)",
+                repaired_value = "(segment removed)",
                 repair_action  = "REMOVED_STRAY_CR",
             ))
             logging.warning(
                 f"[HealthCheck] {file_name} | "
-                f"Line {i + 1}: stray CR removed "
-                f"(source emitted bare LF on previous row)"
+                f"Line {i + 1}: stray CR removed"
             )
             i += 1
             continue
 
         pipes = line.count(DELIMITER)
 
-        # ── Healthy line: correct pipe count + trailing \r ────────────────────
+        # ── Case 2: Healthy CRLF line ─────────────────────────────────────────
         if pipes == expected_pipes and line.endswith(b"\r"):
             logical_in += 1
             _flag_blank_item_number(line, i + 1, repairs)
@@ -154,9 +144,9 @@ def validate_and_repair(raw_bytes: bytes, file_name: str = "") -> HealthCheckRes
             i += 1
             continue
 
-        # ── Broken line: bare-LF split ────────────────────────────────────────
+        # ── Case 3: Embedded bare-LF split ───────────────────────────────────
         if pipes < expected_pipes and not line.endswith(b"\r"):
-            origin   = i + 1       # 1-based for logging
+            origin   = i + 1
             joined   = line
             consumed = 1
 
@@ -164,7 +154,6 @@ def validate_and_repair(raw_bytes: bytes, file_name: str = "") -> HealthCheckRes
                 nxt = i + consumed
                 if nxt >= len(physical):
                     break
-                # Skip any stray-CR segment that appears mid-join
                 if physical[nxt] == b"\r":
                     consumed += 1
                     continue
@@ -185,28 +174,25 @@ def validate_and_repair(raw_bytes: bytes, file_name: str = "") -> HealthCheckRes
                 ))
                 logging.info(
                     f"[HealthCheck] {file_name} | "
-                    f"Repaired line {origin}: embedded LF in ITEM_DESCRIPTION — "
-                    f"joined {consumed} physical lines"
+                    f"Repaired line {origin}: embedded LF — joined {consumed} lines"
                 )
                 logical_in += 1
-                # Check for blank ITEM_NUMBER on the fully joined row
                 _flag_blank_item_number(joined, origin, repairs)
                 logical_rows.append(joined)
                 i += consumed
-
             else:
                 return HealthCheckResult(
                     status="QUARANTINED",
                     quarantine_reason=(
                         f"Line {origin}: embedded LF detected but cannot "
-                        f"reconstruct a complete row after joining {consumed} lines "
+                        f"reconstruct row after joining {consumed} lines "
                         f"(found {joined.count(DELIMITER)} pipes, "
                         f"expected {expected_pipes})"
                     )
                 )
             continue
 
-        # ── Bad pipe count on a CRLF line — cannot auto-repair ────────────────
+        # ── Case 4: Wrong pipe count on CRLF line ────────────────────────────
         if pipes != expected_pipes and line.endswith(b"\r"):
             return HealthCheckResult(
                 status="QUARANTINED",
@@ -217,21 +203,51 @@ def validate_and_repair(raw_bytes: bytes, file_name: str = "") -> HealthCheckRes
                 )
             )
 
-        # ── Unhandled case: excess pipes, no trailing \r — quarantine ─────────
-        # Reached if pipes > expected_pipes and line does not end with \r.
-        # Cannot determine intent; quarantine rather than silently pass through.
+        # ── Case 5: Blank row — ERP export defect (\n\r instead of \r\n) ─────
+        # The row above has correct data and correct pipe count but the line
+        # ending was written as \n\r (inverted). The \r landed alone on the
+        # next segment — this is the "blank row" visible in Excel.
+        # Policy: quarantine with a clear reason. Do NOT auto-repair.
+        # ERP team must regenerate the file.
+        if pipes == expected_pipes and not line.endswith(b"\r"):
+            origin       = i + 1
+            nxt          = i + 1
+            blank_line_no = nxt + 1   # 1-based
+
+            if nxt < len(physical) and physical[nxt] == b"\r":
+                return HealthCheckResult(
+                    status="QUARANTINED",
+                    quarantine_reason=(
+                        f"BLANK_ROW_DETECTED | "
+                        f"Line {blank_line_no}: blank row found. "
+                        f"Caused by inverted line ending (\\n\\r instead of \\r\\n) "
+                        f"on line {origin}. ERP export defect — "
+                        f"file must be regenerated by the ERP team."
+                    )
+                )
+
+            # Correct pipes, no \r, no paired blank row — unhandled
+            return HealthCheckResult(
+                status="QUARANTINED",
+                quarantine_reason=(
+                    f"Line {origin}: correct pipe count ({pipes}) "
+                    f"but no trailing CR. Cannot auto-repair."
+                )
+            )
+
+        # ── Case 6: Unhandled ─────────────────────────────────────────────────
         return HealthCheckResult(
             status="QUARANTINED",
             quarantine_reason=(
                 f"Line {i + 1}: unexpected format — "
-                f"{pipes} pipes found (expected {expected_pipes}), "
+                f"{pipes} pipes (expected {expected_pipes}), "
                 f"no trailing CR. Cannot auto-repair."
             )
         )
 
     # ── Reassemble with normalised CRLF endings ───────────────────────────────
-    clean_bytes  = b"".join(r.rstrip(b"\r") + CRLF for r in logical_rows)
-    logical_out  = len(logical_rows) - 1      # subtract header row
+    clean_bytes = b"".join(r.rstrip(b"\r") + CRLF for r in logical_rows)
+    logical_out = len(logical_rows) - 1
 
     status = "REPAIRED" if repairs else "VALIDATED"
 
@@ -251,9 +267,8 @@ def detect_and_repair_unescaped_quotes(
 ) -> tuple:
     """
     Detects and repairs unescaped double-quotes inside quoted fields.
-
-    The bad pattern:  "This is a "text"."
-    The fix:          "This is a ""text"."
+    Bad pattern:  "This is a "text"."
+    Fixed:        "This is a ""text"."
     """
     try:
         text = raw_bytes.decode("utf-8-sig")
@@ -290,7 +305,6 @@ def _repair_line_quotes(line: str) -> str:
 
     while i < n:
         ch = line[i]
-
         if ch != '"':
             result.append(ch)
             i += 1
@@ -300,11 +314,10 @@ def _repair_line_quotes(line: str) -> str:
         i += 1
 
         while i < n:
-            c = line[i]
+            c       = line[i]
+            next_ch = line[i + 1] if i + 1 < n else ""
 
             if c == '"':
-                next_ch = line[i + 1] if i + 1 < n else ""
-
                 if next_ch == '"':
                     result.append('""')
                     i += 2
@@ -325,7 +338,7 @@ def _repair_line_quotes(line: str) -> str:
 # ─── Internal helpers ─────────────────────────────────────────────────────────
 
 def _flag_blank_item_number(line: bytes, line_no: int, repairs: list):
-    """Log a warning entry when ITEM_NUMBER (field 0) is blank."""
+    """Log a warning when ITEM_NUMBER (field 0) is blank."""
     first = line.split(DELIMITER)[0].strip(b"\r")
     if first == b"":
         repairs.append(RepairEntry(

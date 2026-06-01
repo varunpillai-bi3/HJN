@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import logging
 import urllib.request
@@ -18,11 +19,16 @@ app = func.FunctionApp()
 
 # ─── Teams alert ──────────────────────────────────────────────────────────────
 
+def _is_blank_row_quarantine(reason: str) -> bool:
+    """True if the quarantine reason is a blank-row ERP export defect."""
+    return "BLANK_ROW_DETECTED" in reason
+
+
 def send_teams_alert(
     run_ts_disp:       str,
     actual_count:      int,
     expected:          int,
-    quarantined_files: list[dict],   # [{"name": "file.csv", "reason": "..."}]
+    quarantined_files: list[dict],   # [{"name": "...", "reason": "...", "line_no": "..."}]
     repaired_count:    int,
     valid_count:       int,
     log_path:          str,
@@ -32,17 +38,23 @@ def send_teams_alert(
 
     Card layout
     -----------
-    Status   : ✅ Good  |  🚨 Action Needed
-    ─────────────────────────────────────────
+    OPH Data Pipeline — Run Summary
+    ────────────────────────────────
+    Status            : ✅ Good  |  🚨 Action Needed
     Run Time          : ...
     Total Files       : ...
     Valid Files       : ...
-    Repaired Files    : ...   (auto-fixed, staged with _repaired suffix)
+    Repaired Files    : ...
     Quarantined Files : ...
     Run Log           : ...
-    ─────────────────────────────────────────
-    Quarantined File Details   (only if any)
-      • filename — reason
+
+    Quarantined Files Info  (table — only if any quarantined)
+    ┌─────────────────┬────────────────────┬─────────┬──────────────────┐
+    │ File Name       │ Quarantine Reason  │ Line No │ Next Step        │
+    ├─────────────────┼────────────────────┼─────────┼──────────────────┤
+    │ file.csv        │ Blank row found    │ 5210    │ Contact ERP Team │
+    │ file2.csv       │ Wrong column count │ 42      │ Investigate      │
+    └─────────────────┴────────────────────┴─────────┴──────────────────┘
 
     Never raises — Teams failure must not block the pipeline.
     """
@@ -51,7 +63,7 @@ def send_teams_alert(
         missing     = max(0, expected - actual_count)
         n_quarant   = len(quarantined_files)
 
-        # ── Status header ─────────────────────────────────────────────────────
+        # ── Status ────────────────────────────────────────────────────────────
         if n_quarant > 0 or missing > 0:
             status_text  = "🚨 Action Needed"
             status_color = "Attention"
@@ -87,26 +99,71 @@ def send_teams_alert(
             },
         ]
 
-        # Quarantined file details — name + exact reason
+        # ── Quarantined files table ───────────────────────────────────────────
+        # Adaptive Cards v1.2 does not support a native table element, so we
+        # render a compact ColumnSet per row — gives a clean tabular look.
         if quarantined_files:
             body.append({
                 "type":    "TextBlock",
-                "text":    "**Quarantined File Details**",
+                "text":    "**Quarantined Files Info**",
                 "weight":  "Bolder",
                 "color":   "Attention",
                 "wrap":    True,
                 "spacing": "Medium",
             })
+
+            # Header row
+            body.append({
+                "type": "ColumnSet",
+                "columns": [
+                    {"type": "Column", "width": "stretch", "items": [{"type": "TextBlock", "text": "**File Name**",         "wrap": True, "weight": "Bolder"}]},
+                    {"type": "Column", "width": "stretch", "items": [{"type": "TextBlock", "text": "**Quarantine Reason**", "wrap": True, "weight": "Bolder"}]},
+                    {"type": "Column", "width": "auto",    "items": [{"type": "TextBlock", "text": "**Line No**",           "wrap": True, "weight": "Bolder"}]},
+                    {"type": "Column", "width": "stretch", "items": [{"type": "TextBlock", "text": "**Next Step**",         "wrap": True, "weight": "Bolder"}]},
+                ],
+                "spacing": "Small",
+            })
+
+            # Data rows
             for qf in quarantined_files:
+                raw_reason = qf.get("reason", "")
+                line_no    = qf.get("line_no", "—")
+                is_blank   = _is_blank_row_quarantine(raw_reason)
+
+                # Human-friendly short reason
+                if is_blank:
+                    short_reason = "Blank row found in source file"
+                    next_step    = "⚠️ Contact ERP Team to regenerate file"
+                    row_color    = "Attention"
+                elif "wrong column count" in raw_reason.lower():
+                    short_reason = "Wrong column count"
+                    next_step    = "Investigate source file"
+                    row_color    = "Warning"
+                elif "embedded lf" in raw_reason.lower():
+                    short_reason = "Embedded line break in field"
+                    next_step    = "Investigate source file"
+                    row_color    = "Warning"
+                elif "exception" in raw_reason.lower():
+                    short_reason = "Processing error"
+                    next_step    = "Check run log"
+                    row_color    = "Attention"
+                else:
+                    short_reason = raw_reason[:60]
+                    next_step    = "Investigate source file"
+                    row_color    = "Warning"
+
                 body.append({
-                    "type":    "TextBlock",
-                    "text":    f"• **{qf['name']}**\n  {qf['reason']}",
-                    "wrap":    True,
+                    "type": "ColumnSet",
+                    "columns": [
+                        {"type": "Column", "width": "stretch", "items": [{"type": "TextBlock", "text": qf["name"],     "wrap": True, "color": row_color, "size": "Small"}]},
+                        {"type": "Column", "width": "stretch", "items": [{"type": "TextBlock", "text": short_reason,   "wrap": True, "color": row_color, "size": "Small"}]},
+                        {"type": "Column", "width": "auto",    "items": [{"type": "TextBlock", "text": str(line_no),   "wrap": True, "color": row_color, "size": "Small"}]},
+                        {"type": "Column", "width": "stretch", "items": [{"type": "TextBlock", "text": next_step,      "wrap": True, "color": row_color, "size": "Small"}]},
+                    ],
                     "spacing": "Small",
-                    "color":   "Attention",
                 })
 
-        # Missing files SFTP note
+        # Missing files note
         if missing > 0:
             body.append({
                 "type":    "TextBlock",
@@ -276,16 +333,36 @@ def health_check_http(req: func.HttpRequest) -> func.HttpResponse:
         f"from {len(raw_filenames)} raw entr(ies)"
     )
 
-    # ── Environment variables — all driven from Azure App Settings ────────────
-    conn_str        = os.environ["ADLS_CONNECTION_STRING"]
-    container       = os.environ.get("ADLS_CONTAINER",       "dev")
-    input_path      = os.environ.get("ADLS_INPUT_PATH",      "varun/input")
-    staged_path     = os.environ.get("ADLS_STAGED_PATH",     "varun/output/staged")
-    quarantine_path = os.environ.get("ADLS_QUARANTINE_PATH", "varun/output/quarantine")
-    log_path        = os.environ.get("ADLS_LOG_PATH",        "varun/logs")
+    # ── Read configuration from ADF parameters ────────────────────────────────
+    conn_str        = os.environ["ADLS_CONNECTION_STRING"]          # secret stays in env
+    container       = req_body.get("adls_container", "dev")
+    input_path      = req_body.get("adls_input_path", "varun/input")
+    staged_path     = req_body.get("adls_staged_path", "varun/output/staged")
+    quarantine_path = req_body.get("adls_quarantine_path", "varun/output/quarantine")
+    log_path        = req_body.get("adls_log_path", "varun/logs")
+    expected_count  = int(req_body.get("expected_file_count", 46))
+
+    # ── Validate container name ───────────────────────────────────────────────
+    logging.info(f"[HealthCheck] Using container: {container}")
+    if "/" in container or not container.strip():
+        logging.error(f"[HealthCheck] Invalid container name passed: {container}")
+        return func.HttpResponse(
+            f"Invalid container name: {container}", status_code=400
+        )
+
+    # Optional: whitelist allowed containers
+    allowed_containers = {"dev"}
+    if container not in allowed_containers:
+        logging.error(f"[HealthCheck] Unexpected container: {container}")
+        return func.HttpResponse(
+            f"Unexpected container: {container}", status_code=400
+        )
 
     blob_svc = BlobServiceClient.from_connection_string(conn_str)
+    logging.info(f"[HealthCheck] Confirmed container in use: {container}")
     results  = []
+
+    # (rest of your existing logic continues unchanged)
 
     # ── Per-run tracking (fed into Teams card) ────────────────────────────────
     quarantined_files: list[dict] = []   # {"name": ..., "reason": ...}
@@ -382,7 +459,14 @@ def health_check_http(req: func.HttpRequest) -> func.HttpResponse:
                 dest       = f"{quarantine_path}/{file_name}"
                 data       = raw_bytes
                 status_tag = "QUARANTINED"
-                quarantined_files.append({"name": file_name, "reason": quarantine_reason})
+                # Extract line number from quarantine reason for the Teams table
+                line_no_match = re.search(r"Line (\d+)", quarantine_reason)
+                line_no       = line_no_match.group(1) if line_no_match else "—"
+                quarantined_files.append({
+                    "name":    file_name,
+                    "reason":  quarantine_reason,
+                    "line_no": line_no,
+                })
 
             elif result.status == "REPAIRED":
                 dest       = f"{staged_path}/{_repaired_filename(file_name)}"
@@ -432,7 +516,7 @@ def health_check_http(req: func.HttpRequest) -> func.HttpResponse:
             err_msg = f"FAILED — {file_name} | error: {str(e)}"
             logging.error(f"[HealthCheck] {err_msg}")
             results.append(err_msg)
-            quarantined_files.append({"name": file_name, "reason": f"Exception: {str(e)}"})
+            quarantined_files.append({"name": file_name, "reason": f"Exception: {str(e)}", "line_no": "—"})
             log_buf.append(f"  Status : FAILED")
             log_buf.append(f"  Error  : {str(e)}")
 
