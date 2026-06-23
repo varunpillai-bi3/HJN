@@ -45,7 +45,6 @@ def _classify_issues(result: HealthCheckResult, quote_repair_count: int) -> list
         reason = result.quarantine_reason or "Unknown quarantine reason"
 
         if "BLANK_ROW_DETECTED" in reason:
-            # Extract line number if present
             m = re.search(r"Line (\d+)", reason)
             line_ref = f" at line {m.group(1)}" if m else ""
             issues.append(f"Blank row detected{line_ref} — ERP export defect (inverted \\n\\r line ending)")
@@ -92,6 +91,14 @@ def _classify_issues(result: HealthCheckResult, quote_repair_count: int) -> list
 
 # ─── Teams alert ──────────────────────────────────────────────────────────────
 
+# Teams / Power Automate hard limit is 28 KB per card payload.
+# With large runs (200+ files, many repairs) the card easily exceeds this.
+# These constants cap the table rows and issues-per-row so we stay well under.
+_MAX_INVALID_ROWS = 15   # max rows shown in the invalid-files table
+_MAX_ISSUES_SHOWN = 2    # max issues listed per file before "…and N more"
+_MAX_PAYLOAD_BYTES = 27_000  # safety ceiling; trim to summary-only if exceeded
+
+
 def send_teams_alert(
     run_ts_disp:    str,
     actual_count:   int,
@@ -101,7 +108,7 @@ def send_teams_alert(
     log_path:       str,
 ) -> None:
     """
-    Post an Adaptive Card to Teams.
+    Post an Adaptive Card to Teams via Power Automate webhook.
 
     Card layout
     ───────────
@@ -114,7 +121,7 @@ def send_teams_alert(
     ❌ Invalid Files : ...
     Run Log         : ...
 
-    Invalid Files Detail  (only if any invalid)
+    Invalid Files Detail  (only if any invalid; capped at _MAX_INVALID_ROWS)
     ┌────┬──────────────────┬─────────────────────────────────────────┐
     │ No │ File Name        │ Issues Identified                       │
     ├────┼──────────────────┼─────────────────────────────────────────┤
@@ -165,7 +172,7 @@ def send_teams_alert(
             },
         ]
 
-        # ── Invalid files detail table ────────────────────────────────────────
+        # ── Invalid files detail table (truncated to avoid 28 KB limit) ───────
         if invalid_files:
             body.append({
                 "type":    "TextBlock",
@@ -180,18 +187,23 @@ def send_teams_alert(
             body.append({
                 "type": "ColumnSet",
                 "columns": [
-                    {"type": "Column", "width": "auto",    "items": [{"type": "TextBlock", "text": "**No**",       "wrap": True, "weight": "Bolder"}]},
-                    {"type": "Column", "width": "stretch", "items": [{"type": "TextBlock", "text": "**File Name**","wrap": True, "weight": "Bolder"}]},
-                    {"type": "Column", "width": "stretch", "items": [{"type": "TextBlock", "text": "**Issues Identified**", "wrap": True, "weight": "Bolder"}]},
+                    {"type": "Column", "width": "auto",    "items": [{"type": "TextBlock", "text": "**No**",        "wrap": True, "weight": "Bolder"}]},
+                    {"type": "Column", "width": "stretch", "items": [{"type": "TextBlock", "text": "**File Name**", "wrap": True, "weight": "Bolder"}]},
+                    {"type": "Column", "width": "stretch", "items": [{"type": "TextBlock", "text": "**Issues**",    "wrap": True, "weight": "Bolder"}]},
                 ],
                 "spacing": "Small",
             })
 
-            # Data rows
-            for entry in invalid_files:
-                issues_text = "\n• ".join(entry["issues"]) if entry["issues"] else "Unknown issue"
-                if len(entry["issues"]) > 1:
-                    issues_text = "• " + issues_text
+            display_files = invalid_files[:_MAX_INVALID_ROWS]
+            hidden_count  = n_invalid - len(display_files)
+
+            for entry in display_files:
+                issues = entry["issues"] or ["Unknown issue"]
+                if len(issues) > _MAX_ISSUES_SHOWN:
+                    shown = issues[:_MAX_ISSUES_SHOWN] + [f"…and {len(issues) - _MAX_ISSUES_SHOWN} more"]
+                else:
+                    shown = issues
+                issues_text = ("• " + "\n• ".join(shown)) if len(shown) > 1 else shown[0]
 
                 body.append({
                     "type": "ColumnSet",
@@ -203,7 +215,17 @@ def send_teams_alert(
                     "spacing": "Small",
                 })
 
-        # Missing files note
+            if hidden_count > 0:
+                body.append({
+                    "type":     "TextBlock",
+                    "text":     f"_…and {hidden_count} more invalid file(s). See run log for full details._",
+                    "wrap":     True,
+                    "color":    "Attention",
+                    "isSubtle": True,
+                    "spacing":  "Small",
+                })
+
+        # ── Missing files note ────────────────────────────────────────────────
         if missing > 0:
             body.append({
                 "type":    "TextBlock",
@@ -233,6 +255,37 @@ def send_teams_alert(
         }
 
         data = json.dumps(payload).encode("utf-8")
+
+        # ── Safety fallback: if still too large, strip detail rows ────────────
+        if len(data) > _MAX_PAYLOAD_BYTES:
+            logging.warning(
+                f"[HealthCheck] Card payload {len(data)} bytes exceeds limit — "
+                f"falling back to summary-only card"
+            )
+            fallback_body = [
+                {
+                    "type":   "TextBlock",
+                    "text":   "OPH Data Pipeline — Run Summary",
+                    "weight": "Bolder",
+                    "size":   "Large",
+                    "wrap":   True,
+                },
+                {
+                    "type":  "FactSet",
+                    "facts": summary_facts,
+                },
+                {
+                    "type":  "TextBlock",
+                    "text":  f"⚠️ Card details truncated (payload too large). See run log for full file-by-file breakdown.",
+                    "wrap":  True,
+                    "color": "Warning",
+                },
+            ]
+            payload["attachments"][0]["content"]["body"] = fallback_body
+            data = json.dumps(payload).encode("utf-8")
+
+        logging.info(f"[HealthCheck] Sending Teams card | payload size={len(data)} bytes")
+
         req  = urllib.request.Request(
             webhook_url,
             data    = data,
