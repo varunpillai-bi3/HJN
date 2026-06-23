@@ -204,15 +204,10 @@ def validate_and_repair(raw_bytes: bytes, file_name: str = "") -> HealthCheckRes
             )
 
         # ── Case 5: Blank row — ERP export defect (\n\r instead of \r\n) ─────
-        # The row above has correct data and correct pipe count but the line
-        # ending was written as \n\r (inverted). The \r landed alone on the
-        # next segment — this is the "blank row" visible in Excel.
-        # Policy: quarantine with a clear reason. Do NOT auto-repair.
-        # ERP team must regenerate the file.
         if pipes == expected_pipes and not line.endswith(b"\r"):
             origin       = i + 1
             nxt          = i + 1
-            blank_line_no = nxt + 1   # 1-based
+            blank_line_no = nxt + 1
 
             if nxt < len(physical) and physical[nxt] == b"\r":
                 return HealthCheckResult(
@@ -226,7 +221,6 @@ def validate_and_repair(raw_bytes: bytes, file_name: str = "") -> HealthCheckRes
                     )
                 )
 
-            # Correct pipes, no \r, no paired blank row — unhandled
             return HealthCheckResult(
                 status="QUARANTINED",
                 quarantine_reason=(

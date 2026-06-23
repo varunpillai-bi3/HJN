@@ -6,83 +6,149 @@ import urllib.request
 from datetime import datetime
 import azure.functions as func
 from azure.storage.blob import BlobServiceClient, ContentSettings
+from azure.identity import ManagedIdentityCredential
+from azure.keyvault.secrets import SecretClient
 
 from health_check import (
     validate_and_repair,
     detect_and_repair_unescaped_quotes,
-    RepairEntry,
     HealthCheckResult,
 )
 
 app = func.FunctionApp()
 
 
+# ─── Key Vault helper ──────────────────────────────────────────────────────────
+
+def _get_secret(secret_name: str) -> str:
+    """
+    Fetch a secret from Azure Key Vault using Managed Identity.
+    KEY_VAULT_URL must be set in App Settings (non-secret).
+    e.g. https://kvhjaaz1dadp01.vault.azure.net/
+    """
+    kv_url     = os.environ["KEY_VAULT_URL"]
+    credential = ManagedIdentityCredential()
+    client     = SecretClient(vault_url=kv_url, credential=credential)
+    return client.get_secret(secret_name).value
+
+
+# ─── Issue classifier ──────────────────────────────────────────────────────────
+
+def _classify_issues(result: HealthCheckResult, quote_repair_count: int) -> list[str]:
+    """
+    Return a list of human-readable issue descriptions found in a file.
+    Called even when we are NOT repairing — purely for notification.
+    """
+    issues = []
+
+    if result.status == "QUARANTINED":
+        reason = result.quarantine_reason or "Unknown quarantine reason"
+
+        if "BLANK_ROW_DETECTED" in reason:
+            # Extract line number if present
+            m = re.search(r"Line (\d+)", reason)
+            line_ref = f" at line {m.group(1)}" if m else ""
+            issues.append(f"Blank row detected{line_ref} — ERP export defect (inverted \\n\\r line ending)")
+
+        elif "embedded lf" in reason.lower() or "embedded bare lf" in reason.lower():
+            m = re.search(r"Line (\d+)", reason)
+            line_ref = f" at line {m.group(1)}" if m else ""
+            issues.append(f"Embedded line break in field{line_ref} — record split across multiple physical lines")
+
+        elif "wrong column count" in reason.lower():
+            m = re.search(r"Line (\d+)", reason)
+            line_ref = f" at line {m.group(1)}" if m else ""
+            issues.append(f"Wrong column count{line_ref} — column mismatch, cannot parse row")
+
+        elif "zero bytes" in reason.lower():
+            issues.append("File is empty (zero bytes)")
+
+        elif "delimiter" in reason.lower():
+            issues.append("Header missing pipe delimiter '|' — file may be in wrong format")
+
+        else:
+            issues.append(reason)
+
+    else:
+        # VALIDATED or REPAIRED — check what repairs were found
+        rule_map = {
+            "EMBEDDED_BARE_LF": "Embedded line break in field — record split across multiple physical lines",
+            "STRAY_CR":         "Stray carriage return found — artefact of broken line ending",
+            "BLANK_ITEM_NUMBER":"Blank Item Number — first field empty after line-break join",
+            "UNESCAPED_QUOTE":  "Unescaped double-quote inside field value",
+        }
+        seen = set()
+        for r in result.repairs:
+            label = rule_map.get(r.rule_violated, r.rule_violated)
+            if label not in seen:
+                issues.append(label)
+                seen.add(label)
+
+    if quote_repair_count > 0 and "Unescaped double-quote inside field value" not in issues:
+        issues.append("Unescaped double-quote inside field value")
+
+    return issues
+
+
 # ─── Teams alert ──────────────────────────────────────────────────────────────
 
-def _is_blank_row_quarantine(reason: str) -> bool:
-    """True if the quarantine reason is a blank-row ERP export defect."""
-    return "BLANK_ROW_DETECTED" in reason
-
-
 def send_teams_alert(
-    run_ts_disp:       str,
-    actual_count:      int,
-    expected:          int,
-    quarantined_files: list[dict],   # [{"name": "...", "reason": "...", "line_no": "..."}]
-    repaired_count:    int,
-    valid_count:       int,
-    log_path:          str,
+    run_ts_disp:    str,
+    actual_count:   int,
+    expected:       int,
+    valid_files:    list[str],
+    invalid_files:  list[dict],   # [{"name": "...", "file_no": N, "issues": [...]}]
+    log_path:       str,
 ) -> None:
     """
-    Post an Adaptive Card to Teams via Power Automate webhook.
+    Post an Adaptive Card to Teams.
 
     Card layout
-    -----------
+    ───────────
     OPH Data Pipeline — Run Summary
-    ────────────────────────────────
-    Status            : ✅ Good  |  🚨 Action Needed
-    Run Time          : ...
-    Total Files       : ...
-    Valid Files       : ...
-    Repaired Files    : ...
-    Quarantined Files : ...
-    Run Log           : ...
+    ─────────────────────────────────────────────────────
+    Status          : ✅ All Good  |  🚨 Issues Found
+    Run Time        : ...
+    Files Received  : ...
+    ✅ Valid Files   : ...
+    ❌ Invalid Files : ...
+    Run Log         : ...
 
-    Quarantined Files Info  (table — only if any quarantined)
-    ┌─────────────────┬────────────────────┬─────────┬──────────────────┐
-    │ File Name       │ Quarantine Reason  │ Line No │ Next Step        │
-    ├─────────────────┼────────────────────┼─────────┼──────────────────┤
-    │ file.csv        │ Blank row found    │ 5210    │ Contact ERP Team │
-    │ file2.csv       │ Wrong column count │ 42      │ Investigate      │
-    └─────────────────┴────────────────────┴─────────┴──────────────────┘
+    Invalid Files Detail  (only if any invalid)
+    ┌────┬──────────────────┬─────────────────────────────────────────┐
+    │ No │ File Name        │ Issues Identified                       │
+    ├────┼──────────────────┼─────────────────────────────────────────┤
+    │  1 │ file1.csv        │ Blank row detected at line 5210         │
+    │  2 │ file2.csv        │ Wrong column count at line 42           │
+    └────┴──────────────────┴─────────────────────────────────────────┘
 
     Never raises — Teams failure must not block the pipeline.
     """
     try:
-        webhook_url = os.environ["TEAMS_WEBHOOK_URL"]
-        missing     = max(0, expected - actual_count)
-        n_quarant   = len(quarantined_files)
+        webhook_url  = _get_secret("webhook-url-teams-oph")
+        n_invalid    = len(invalid_files)
+        n_valid      = len(valid_files)
+        missing      = max(0, expected - actual_count)
 
         # ── Status ────────────────────────────────────────────────────────────
-        if n_quarant > 0 or missing > 0:
-            status_text  = "🚨 Action Needed"
+        if n_invalid > 0 or missing > 0:
+            status_text  = "🚨 Issues Found — Action Needed"
             status_color = "Attention"
         else:
-            status_text  = "✅ Good"
+            status_text  = "✅ All Good"
             status_color = "Good"
 
         # ── Summary facts ─────────────────────────────────────────────────────
         summary_facts = [
-            {"title": "Status",            "value": status_text},
-            {"title": "Run Time",          "value": run_ts_disp},
-            {"title": "Total Files",       "value": str(actual_count)},
-            {"title": "Valid Files",       "value": str(valid_count)},
-            {"title": "Repaired Files",    "value": str(repaired_count)},
-            {"title": "Quarantined Files", "value": str(n_quarant)},
-            {"title": "Run Log",           "value": log_path},
+            {"title": "Status",           "value": status_text},
+            {"title": "Run Time",         "value": run_ts_disp},
+            {"title": "Files Received",   "value": str(actual_count)},
+            {"title": "✅ Valid Files",    "value": str(n_valid)},
+            {"title": "❌ Invalid Files",  "value": str(n_invalid)},
+            {"title": "Run Log",          "value": log_path},
         ]
         if missing > 0:
-            summary_facts.insert(3, {"title": "Missing Files", "value": str(missing)})
+            summary_facts.insert(4, {"title": "⚠️ Missing Files", "value": str(missing)})
 
         # ── Card body ─────────────────────────────────────────────────────────
         body = [
@@ -99,13 +165,11 @@ def send_teams_alert(
             },
         ]
 
-        # ── Quarantined files table ───────────────────────────────────────────
-        # Adaptive Cards v1.2 does not support a native table element, so we
-        # render a compact ColumnSet per row — gives a clean tabular look.
-        if quarantined_files:
+        # ── Invalid files detail table ────────────────────────────────────────
+        if invalid_files:
             body.append({
                 "type":    "TextBlock",
-                "text":    "**Quarantined Files Info**",
+                "text":    "**❌ Invalid Files — Issues Identified**",
                 "weight":  "Bolder",
                 "color":   "Attention",
                 "wrap":    True,
@@ -116,49 +180,25 @@ def send_teams_alert(
             body.append({
                 "type": "ColumnSet",
                 "columns": [
-                    {"type": "Column", "width": "stretch", "items": [{"type": "TextBlock", "text": "**File Name**",         "wrap": True, "weight": "Bolder"}]},
-                    {"type": "Column", "width": "stretch", "items": [{"type": "TextBlock", "text": "**Quarantine Reason**", "wrap": True, "weight": "Bolder"}]},
-                    {"type": "Column", "width": "auto",    "items": [{"type": "TextBlock", "text": "**Line No**",           "wrap": True, "weight": "Bolder"}]},
-                    {"type": "Column", "width": "stretch", "items": [{"type": "TextBlock", "text": "**Next Step**",         "wrap": True, "weight": "Bolder"}]},
+                    {"type": "Column", "width": "auto",    "items": [{"type": "TextBlock", "text": "**No**",       "wrap": True, "weight": "Bolder"}]},
+                    {"type": "Column", "width": "stretch", "items": [{"type": "TextBlock", "text": "**File Name**","wrap": True, "weight": "Bolder"}]},
+                    {"type": "Column", "width": "stretch", "items": [{"type": "TextBlock", "text": "**Issues Identified**", "wrap": True, "weight": "Bolder"}]},
                 ],
                 "spacing": "Small",
             })
 
             # Data rows
-            for qf in quarantined_files:
-                raw_reason = qf.get("reason", "")
-                line_no    = qf.get("line_no", "—")
-                is_blank   = _is_blank_row_quarantine(raw_reason)
-
-                # Human-friendly short reason
-                if is_blank:
-                    short_reason = "Blank row found in source file"
-                    next_step    = "⚠️ Contact ERP Team to regenerate file"
-                    row_color    = "Attention"
-                elif "wrong column count" in raw_reason.lower():
-                    short_reason = "Wrong column count"
-                    next_step    = "Investigate source file"
-                    row_color    = "Warning"
-                elif "embedded lf" in raw_reason.lower():
-                    short_reason = "Embedded line break in field"
-                    next_step    = "Investigate source file"
-                    row_color    = "Warning"
-                elif "exception" in raw_reason.lower():
-                    short_reason = "Processing error"
-                    next_step    = "Check run log"
-                    row_color    = "Attention"
-                else:
-                    short_reason = raw_reason[:60]
-                    next_step    = "Investigate source file"
-                    row_color    = "Warning"
+            for entry in invalid_files:
+                issues_text = "\n• ".join(entry["issues"]) if entry["issues"] else "Unknown issue"
+                if len(entry["issues"]) > 1:
+                    issues_text = "• " + issues_text
 
                 body.append({
                     "type": "ColumnSet",
                     "columns": [
-                        {"type": "Column", "width": "stretch", "items": [{"type": "TextBlock", "text": qf["name"],     "wrap": True, "color": row_color, "size": "Small"}]},
-                        {"type": "Column", "width": "stretch", "items": [{"type": "TextBlock", "text": short_reason,   "wrap": True, "color": row_color, "size": "Small"}]},
-                        {"type": "Column", "width": "auto",    "items": [{"type": "TextBlock", "text": str(line_no),   "wrap": True, "color": row_color, "size": "Small"}]},
-                        {"type": "Column", "width": "stretch", "items": [{"type": "TextBlock", "text": next_step,      "wrap": True, "color": row_color, "size": "Small"}]},
+                        {"type": "Column", "width": "auto",    "items": [{"type": "TextBlock", "text": str(entry["file_no"]), "wrap": True, "color": "Attention", "size": "Small"}]},
+                        {"type": "Column", "width": "stretch", "items": [{"type": "TextBlock", "text": entry["name"],         "wrap": True, "color": "Attention", "size": "Small"}]},
+                        {"type": "Column", "width": "stretch", "items": [{"type": "TextBlock", "text": issues_text,           "wrap": True, "color": "Attention", "size": "Small"}]},
                     ],
                     "spacing": "Small",
                 })
@@ -220,19 +260,7 @@ def _upload_run_log(
     log_lines:  list[str],
 ) -> str:
     """
-    Write a plain-text run log to  <log_path>/YYYY/MM/DD/run_<timestamp>.txt
-
-    Uses ADLS_LOG_PATH (varun/logs) — a folder that is intentionally excluded
-    from ADF delete activities so logs accumulate permanently.
-
-    Structure on ADLS:
-        varun/logs/
-            2026/
-                05/
-                    27/
-                        run_20260527_093012_UTC.txt
-                        run_20260527_141500_UTC.txt
-
+    Write a plain-text run log to <log_path>/YYYY/MM/DD/run_<timestamp>.txt
     Returns the full blob path so it can be shown in the Teams card.
     Never raises — log failure must not block the pipeline.
     """
@@ -263,12 +291,6 @@ def _upload_run_log(
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
-
-def _repaired_filename(file_name: str) -> str:
-    """file2.csv → file2_repaired.csv"""
-    base, ext = os.path.splitext(file_name)
-    return f"{base}_repaired{ext}"
-
 
 def _normalise_filenames(raw: list) -> list[str]:
     """
@@ -333,14 +355,21 @@ def health_check_http(req: func.HttpRequest) -> func.HttpResponse:
         f"from {len(raw_filenames)} raw entr(ies)"
     )
 
-    # ── Read configuration from ADF parameters ────────────────────────────────
-    conn_str        = os.environ["ADLS_CONNECTION_STRING"]          # secret stays in env
-    container       = req_body.get("adls_container", "dev")
-    input_path      = req_body.get("adls_input_path", "varun/input")
-    staged_path     = req_body.get("adls_staged_path", "varun/output/staged")
-    quarantine_path = req_body.get("adls_quarantine_path", "varun/output/quarantine")
-    log_path        = req_body.get("adls_log_path", "varun/logs")
-    expected_count  = int(req_body.get("expected_file_count", 46))
+    # ── Read secrets from Key Vault ───────────────────────────────────────────
+    try:
+        conn_str = _get_secret("adls-con-str")
+        logging.info("[HealthCheck] ADLS connection string fetched from KV")
+    except Exception as e:
+        logging.error(f"[HealthCheck] Failed to fetch adls-con-str from KV — {e}")
+        return func.HttpResponse(
+            f"Failed to fetch secret from Key Vault: {str(e)}", status_code=500
+        )
+
+    # ── Read configuration from ADF request body ──────────────────────────────
+    container      = req_body.get("adls_container", "dev")
+    input_path     = req_body.get("adls_input_path", "varun/input")
+    log_path       = req_body.get("adls_log_path", "varun/logs")
+    expected_count = int(req_body.get("expected_file_count", 46))
 
     # ── Validate container name ───────────────────────────────────────────────
     logging.info(f"[HealthCheck] Using container: {container}")
@@ -350,7 +379,6 @@ def health_check_http(req: func.HttpRequest) -> func.HttpResponse:
             f"Invalid container name: {container}", status_code=400
         )
 
-    # Optional: whitelist allowed containers
     allowed_containers = {"dev"}
     if container not in allowed_containers:
         logging.error(f"[HealthCheck] Unexpected container: {container}")
@@ -360,19 +388,17 @@ def health_check_http(req: func.HttpRequest) -> func.HttpResponse:
 
     blob_svc = BlobServiceClient.from_connection_string(conn_str)
     logging.info(f"[HealthCheck] Confirmed container in use: {container}")
-    results  = []
 
-    # (rest of your existing logic continues unchanged)
-
-    # ── Per-run tracking (fed into Teams card) ────────────────────────────────
-    quarantined_files: list[dict] = []   # {"name": ..., "reason": ...}
-    repaired_files:    list[str]  = []
-    valid_files:       list[str]  = []
+    # ── Per-run tracking ──────────────────────────────────────────────────────
+    valid_files:   list[str]  = []
+    invalid_files: list[dict] = []   # {"file_no": N, "name": "...", "issues": [...]}
+    results:       list[str]  = []
+    file_no = 0
 
     # ── Run log buffer ────────────────────────────────────────────────────────
     log_buf: list[str] = [
         "=" * 72,
-        "OPH Health-Check Pipeline Run Log",
+        "OPH Health-Check Pipeline Run Log  [NOTIFICATION MODE — read-only]",
         f"Run timestamp : {run_ts_disp}",
         f"Files received: {len(filenames)}",
         f"Log path      : {container}/{log_path}",
@@ -380,12 +406,8 @@ def health_check_http(req: func.HttpRequest) -> func.HttpResponse:
         "",
     ]
 
-    # ── Process each file ─────────────────────────────────────────────────────
+    # ── Inspect each file (read-only — no writes to staged/quarantine) ────────
     for file_name in filenames:
-        quote_repair_count  = 0
-        quote_issues:  list[str] = []
-        quarantine_reason: str   = ""
-
         log_buf.append(f"--- {file_name} ---")
 
         if not file_name.endswith(".csv"):
@@ -394,8 +416,10 @@ def health_check_http(req: func.HttpRequest) -> func.HttpResponse:
             log_buf.append("")
             continue
 
+        file_no += 1
+
         try:
-            # Read source blob
+            # Read source blob — no writes anywhere
             raw_bytes = blob_svc.get_blob_client(
                 container = container,
                 blob      = f"{input_path}/{file_name}",
@@ -406,7 +430,7 @@ def health_check_http(req: func.HttpRequest) -> func.HttpResponse:
                 f"[HealthCheck] FILE READ — {file_name} | size={len(raw_bytes)} bytes"
             )
 
-            # Stage 1 — structural validation + repair
+            # Stage 1 — structural inspection
             result: HealthCheckResult = validate_and_repair(raw_bytes, file_name)
             logging.info(
                 f"[HealthCheck] Structural check — {file_name} "
@@ -415,115 +439,63 @@ def health_check_http(req: func.HttpRequest) -> func.HttpResponse:
                 f"| rows_out={result.logical_rows_out}"
             )
 
-            # Stage 2 — unescaped quote repair (skip if already quarantined)
+            # Stage 2 — unescaped quote inspection
+            quote_repair_count = 0
             if result.status != "QUARANTINED" and result.clean_bytes is not None:
-                repaired_bytes, quote_repair_count, quote_issues = \
-                    detect_and_repair_unescaped_quotes(result.clean_bytes, file_name)
-
+                _, quote_repair_count, _ = detect_and_repair_unescaped_quotes(
+                    result.clean_bytes, file_name
+                )
                 if quote_repair_count > 0:
                     logging.warning(
-                        f"[HealthCheck] UNESCAPED QUOTES — {file_name} | "
-                        f"{quote_repair_count} line(s) repaired"
+                        f"[HealthCheck] UNESCAPED QUOTES FOUND — {file_name} | "
+                        f"{quote_repair_count} line(s) affected"
                     )
-                    result.clean_bytes = repaired_bytes
-                    for issue in quote_issues:
-                        result.repairs.append(RepairEntry(
-                            line_number    = 0,
-                            column_name    = "DESCRIPTION",
-                            rule_violated  = "UNESCAPED_QUOTE",
-                            original_value = issue,
-                            repaired_value = "(unescaped quote doubled)",
-                            repair_action  = "DOUBLED_UNESCAPED_QUOTE",
-                        ))
-                    result.status = "REPAIRED"
-                else:
-                    logging.info(f"[HealthCheck] Quote check OK — {file_name}")
-            else:
-                logging.info(
-                    f"[HealthCheck] Quote check SKIPPED — {file_name} already QUARANTINED"
-                )
 
-            # Capture quarantine reason before routing
-            if result.status == "QUARANTINED" or not result.counts_match:
-                quarantine_reason = (
-                    result.quarantine_reason
-                    or (
-                        f"Row count mismatch — "
-                        f"rows_in={result.logical_rows_in}, "
-                        f"rows_out={result.logical_rows_out}"
-                    )
-                )
+            # ── Classify as VALID or INVALID ──────────────────────────────────
+            is_invalid = (
+                result.status == "QUARANTINED"
+                or not result.counts_match
+                or len(result.repairs) > 0
+                or quote_repair_count > 0
+            )
 
-            # Route to staged / quarantine
-            if result.status == "QUARANTINED" or not result.counts_match:
-                dest       = f"{quarantine_path}/{file_name}"
-                data       = raw_bytes
-                status_tag = "QUARANTINED"
-                # Extract line number from quarantine reason for the Teams table
-                line_no_match = re.search(r"Line (\d+)", quarantine_reason)
-                line_no       = line_no_match.group(1) if line_no_match else "—"
-                quarantined_files.append({
+            if is_invalid:
+                issues = _classify_issues(result, quote_repair_count)
+                invalid_files.append({
+                    "file_no": file_no,
                     "name":    file_name,
-                    "reason":  quarantine_reason,
-                    "line_no": line_no,
+                    "issues":  issues,
                 })
-
-            elif result.status == "REPAIRED":
-                dest       = f"{staged_path}/{_repaired_filename(file_name)}"
-                data       = result.clean_bytes
-                status_tag = "REPAIRED"
-                repaired_files.append(file_name)
-
-            else:   # VALIDATED
-                dest       = f"{staged_path}/{file_name}"
-                data       = result.clean_bytes
-                status_tag = "VALID"
+                results.append(
+                    f"INVALID — {file_name} | issues: {'; '.join(issues)}"
+                )
+                log_buf.append(f"  Status : INVALID")
+                for issue in issues:
+                    log_buf.append(f"  Issue  : {issue}")
+            else:
                 valid_files.append(file_name)
+                results.append(f"VALID — {file_name}")
+                log_buf.append(f"  Status : VALID")
 
-            dest_label = f"{container}/{dest}"
-
-            # Upload result blob
-            blob_svc.get_blob_client(
-                container=container, blob=dest
-            ).upload_blob(
-                data,
-                overwrite        = True,
-                content_settings = ContentSettings(content_type="text/csv"),
-            )
-            logging.info(f"[HealthCheck] SUCCESS — {file_name} → {dest_label}")
-
-            quote_note  = f" | quote_repairs={quote_repair_count}" if quote_repair_count > 0 else ""
-            results.append(
-                f"{status_tag} — {file_name} → {dest_label} "
-                f"| rows={result.logical_rows_out} "
-                f"| repairs={result.repairs_made}"
-                f"{quote_note}"
-            )
-
-            log_buf.append(f"  Status       : {status_tag}")
-            log_buf.append(f"  Destination  : {dest_label}")
-            log_buf.append(f"  Rows in      : {result.logical_rows_in}")
-            log_buf.append(f"  Rows out     : {result.logical_rows_out}")
-            log_buf.append(f"  Repairs made : {result.repairs_made}")
-            if status_tag == "QUARANTINED":
-                log_buf.append(f"  Reason       : {quarantine_reason}")
-            if quote_repair_count > 0:
-                log_buf.append(f"  Quote repairs: {quote_repair_count}")
-                for issue in quote_issues:
-                    log_buf.append(f"    - {issue}")
+            log_buf.append(f"  Rows in : {result.logical_rows_in}")
+            log_buf.append(f"  Rows out: {result.logical_rows_out}")
 
         except Exception as e:
             err_msg = f"FAILED — {file_name} | error: {str(e)}"
             logging.error(f"[HealthCheck] {err_msg}")
             results.append(err_msg)
-            quarantined_files.append({"name": file_name, "reason": f"Exception: {str(e)}", "line_no": "—"})
+            invalid_files.append({
+                "file_no": file_no,
+                "name":    file_name,
+                "issues":  [f"Read error: {str(e)}"],
+            })
             log_buf.append(f"  Status : FAILED")
             log_buf.append(f"  Error  : {str(e)}")
 
         log_buf.append("")
 
     # ── File count check ──────────────────────────────────────────────────────
-    expected_count = int(os.environ.get("EXPECTED_FILE_COUNT", "46"))
+    expected_count = int(os.environ.get("EXPECTED_FILE_COUNT", str(expected_count)))
     actual_count   = len([f for f in filenames if f.endswith(".csv")])
 
     logging.info(
@@ -531,12 +503,11 @@ def health_check_http(req: func.HttpRequest) -> func.HttpResponse:
     )
 
     log_buf.append("=" * 72)
-    log_buf.append("File Count Check")
+    log_buf.append("File Count Summary")
     log_buf.append(f"  Expected : {expected_count}")
     log_buf.append(f"  Received : {actual_count}")
     log_buf.append(f"  Valid    : {len(valid_files)}")
-    log_buf.append(f"  Repaired : {len(repaired_files)}")
-    log_buf.append(f"  Quarant. : {len(quarantined_files)}")
+    log_buf.append(f"  Invalid  : {len(invalid_files)}")
 
     if actual_count < expected_count:
         missing = expected_count - actual_count
@@ -556,7 +527,7 @@ def health_check_http(req: func.HttpRequest) -> func.HttpResponse:
     log_buf.append("=" * 72)
     log_buf.append(f"End of run — {run_ts_disp}")
 
-    # ── Write log to varun/logs/YYYY/MM/DD/ ───────────────────────────────────
+    # ── Write run log ─────────────────────────────────────────────────────────
     log_full_path = _upload_run_log(
         blob_svc  = blob_svc,
         container = container,
@@ -565,15 +536,14 @@ def health_check_http(req: func.HttpRequest) -> func.HttpResponse:
         log_lines = log_buf,
     )
 
-    # ── Send Teams alert (every run) ──────────────────────────────────────────
+    # ── Send Teams alert ──────────────────────────────────────────────────────
     send_teams_alert(
-        run_ts_disp       = run_ts_disp,
-        actual_count      = actual_count,
-        expected          = expected_count,
-        quarantined_files = quarantined_files,
-        repaired_count    = len(repaired_files),
-        valid_count       = len(valid_files),
-        log_path          = log_full_path,
+        run_ts_disp   = run_ts_disp,
+        actual_count  = actual_count,
+        expected      = expected_count,
+        valid_files   = valid_files,
+        invalid_files = invalid_files,
+        log_path      = log_full_path,
     )
 
     return func.HttpResponse("\n".join(results), status_code=200)
